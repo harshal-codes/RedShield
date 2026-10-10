@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: openeasd
+  namespace: default
+  labels:
+    app: openeasd
+spec:
+  selector:
+    app: openeasd
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+      nodePort: 30808
+  type: NodePort

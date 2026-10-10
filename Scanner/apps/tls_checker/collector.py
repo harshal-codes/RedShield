@@ -1,0 +1,573 @@
+"""TLS Checker — probes all non-web open ports for encryption status and configuration.
+
+Checks based on:
+  - TLS Hardening Guide (cybersecify.com/blog/tls-hardening-guide)
+  - TLS Attacks & Vulnerabilities (cybersecify.com/blog/tls-attacks-and-vulnerabilities)
+  - TLS 1.3 Modern Standard (cybersecify.com/blog/tls-1-3-modern-standard)
+  - TLS 1.2 Deep Dive (cybersecify.com/blog/tls-1-2-deep-dive)
+  - MITM Attacks Detection (cybersecify.com/blog/mitm-attacks-detection-prevention)
+  - Cryptography Fundamentals (cybersecify.com/blog/cryptography-fundamentals)
+
+Probes all open ports via Python stdlib ssl/smtplib/imaplib/poplib/ftplib.
+Cipher suite enumeration uses nmap --script ssl-enum-ciphers.
+Inherently insecure protocols (Telnet, rsh, etc.) always flagged without probing.
+"""
+
+import ftplib  # nosec B402 — intentional: probing FTP servers to detect their exposure
+import imaplib
+import logging
+import poplib
+import smtplib
+import socket
+import ssl
+import subprocess
+import defusedxml.ElementTree as ET
+
+from django.utils import timezone as django_tz
+
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric import ec, rsa, dsa
+from cryptography.hazmat.primitives.hashes import SHA1
+
+logger = logging.getLogger(__name__)
+
+PROBE_TIMEOUT = 5  # seconds per port
+
+# Services that use STARTTLS — must negotiate TLS after plaintext greeting
+_STARTTLS_SERVICES = frozenset({"smtp", "submission", "imap", "pop3", "ftp"})
+
+# Services that support TLS (STARTTLS or direct) but may run without it.
+# https/http-alt are included so HTTPS ports get full TLS probing, not silent skip.
+TLS_CAPABLE_SERVICES = frozenset({
+    "smtp", "submission", "imap", "pop3", "ftp", "ldap",
+    "mysql", "postgresql", "ms-sql-s", "mongodb",
+    "redis", "rdp", "ms-wbt-server", "vnc",
+    "memcached", "couchdb", "elasticsearch", "amqp",
+    "https", "http-alt",
+})
+
+# Services with no TLS standard — always an unencrypted finding
+INHERENTLY_INSECURE_SERVICES = frozenset({
+    "telnet", "rlogin", "rsh", "rexec",
+})
+
+# Legacy TLS versions to probe (may not be available on all OpenSSL builds)
+_LEGACY_TLS_VERSIONS: list[tuple] = []
+for _attr, _key in [("TLSv1", "tls10"), ("TLSv1_1", "tls11")]:
+    if hasattr(ssl.TLSVersion, _attr):
+        _LEGACY_TLS_VERSIONS.append((getattr(ssl.TLSVersion, _attr), _key))
+
+
+# ---------------------------------------------------------------------------
+# STARTTLS probers (stdlib only)
+# ---------------------------------------------------------------------------
+
+def _probe_starttls_smtp(ip: str, port: int) -> bool:
+    try:
+        with smtplib.SMTP(host=ip, port=port, timeout=PROBE_TIMEOUT) as s:
+            s.starttls()
+            return True
+    except (OSError, smtplib.SMTPException):
+        return False
+    except Exception as e:
+        logger.debug(f"[tls_checker] STARTTLS SMTP probe failed on {ip}:{port}: {type(e).__name__}: {e}")
+        return False
+
+
+def _probe_starttls_imap(ip: str, port: int) -> bool:
+    try:
+        m = imaplib.IMAP4(host=ip, port=port, timeout=PROBE_TIMEOUT)
+        m.starttls()
+        m.logout()
+        return True
+    except (OSError, imaplib.IMAP4.error):
+        return False
+    except Exception as e:
+        logger.debug(f"[tls_checker] STARTTLS IMAP probe failed on {ip}:{port}: {type(e).__name__}: {e}")
+        return False
+
+
+def _probe_starttls_pop3(ip: str, port: int) -> bool:
+    try:
+        m = poplib.POP3(host=ip, port=port, timeout=PROBE_TIMEOUT)
+        m.stls()
+        m.quit()
+        return True
+    except (OSError, poplib.error_proto):
+        return False
+    except Exception as e:
+        logger.debug(f"[tls_checker] STARTTLS POP3 probe failed on {ip}:{port}: {type(e).__name__}: {e}")
+        return False
+
+
+def _probe_starttls_ftp(ip: str, port: int) -> bool:
+    try:
+        ftp = ftplib.FTP_TLS()
+        ftp.connect(host=ip, port=port, timeout=PROBE_TIMEOUT)
+        ftp.auth()
+        ftp.quit()
+        return True
+    except (OSError, ftplib.Error):
+        return False
+    except Exception as e:
+        logger.debug(f"[tls_checker] STARTTLS FTP probe failed on {ip}:{port}: {type(e).__name__}: {e}")
+        return False
+
+
+_STARTTLS_PROBERS = {
+    "smtp":       _probe_starttls_smtp,
+    "submission": _probe_starttls_smtp,
+    "imap":       _probe_starttls_imap,
+    "pop3":       _probe_starttls_pop3,
+    "ftp":        _probe_starttls_ftp,
+}
+
+
+# ---------------------------------------------------------------------------
+# TLS detail probing
+# ---------------------------------------------------------------------------
+
+def _tls_context() -> ssl.SSLContext:
+    """Base context: no hostname/cert validation (we probe presence + config)."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _parse_cert_details(der_bytes: bytes, hostname: str | None = None) -> dict:
+    """
+    Parse DER-encoded certificate bytes via ``cryptography`` and return a dict
+    of certificate metadata.  Returns safe defaults on any parsing error.
+
+    Fields returned:
+      cert_expiry_days   — int (days until expiry, negative = expired)
+      cert_self_signed   — bool (issuer == subject)
+      cert_key_type      — "RSA" | "EC" | "DSA" | "unknown"
+      cert_key_bits      — int (key size in bits)
+      cert_sig_algorithm — str (OID name, e.g. "sha256WithRSAEncryption")
+      cert_sig_sha1      — bool (True if signature uses SHA-1)
+      cert_san_list      — list[str] (DNS names from SAN extension)
+      cert_san_mismatch  — bool (hostname not in SAN list)
+      cert_has_sct       — bool (SCT extension present)
+    """
+    defaults: dict = {
+        "cert_expiry_days": None, "cert_self_signed": False,
+        "cert_key_type": None, "cert_key_bits": None,
+        "cert_sig_algorithm": None, "cert_sig_sha1": False,
+        "cert_san_list": [], "cert_san_mismatch": False,
+        "cert_has_sct": False,
+    }
+    try:
+        cert = x509.load_der_x509_certificate(der_bytes)
+    except Exception:
+        return defaults
+
+    result = dict(defaults)
+
+    # ── Expiry ───────────────────────────────────────────────────────────
+    try:
+        expiry = cert.not_valid_after_utc
+        result["cert_expiry_days"] = (expiry - django_tz.now()).days
+    except Exception:
+        pass
+
+    # ── Self-signed ──────────────────────────────────────────────────────
+    try:
+        result["cert_self_signed"] = cert.issuer == cert.subject
+    except Exception:
+        pass
+
+    # ── Key type & size ──────────────────────────────────────────────────
+    try:
+        pub = cert.public_key()
+        if isinstance(pub, rsa.RSAPublicKey):
+            result["cert_key_type"] = "RSA"
+        elif isinstance(pub, ec.EllipticCurvePublicKey):
+            result["cert_key_type"] = "EC"
+        elif isinstance(pub, dsa.DSAPublicKey):
+            result["cert_key_type"] = "DSA"
+        else:
+            result["cert_key_type"] = "unknown"
+        result["cert_key_bits"] = pub.key_size
+    except Exception:
+        pass
+
+    # ── Signature algorithm ──────────────────────────────────────────────
+    try:
+        result["cert_sig_algorithm"] = cert.signature_algorithm_oid._name
+        result["cert_sig_sha1"] = isinstance(cert.signature_hash_algorithm, SHA1)
+    except Exception:
+        pass
+
+    # ── Subject Alternative Names ────────────────────────────────────────
+    try:
+        san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        san_list = san_ext.value.get_values_for_type(x509.DNSName)
+        result["cert_san_list"] = san_list
+        if hostname and not _is_ip_address(hostname):
+            result["cert_san_mismatch"] = not _hostname_matches_san(hostname, san_list)
+    except x509.ExtensionNotFound:
+        # No SAN extension — mismatch only if hostname given
+        if hostname and not _is_ip_address(hostname):
+            result["cert_san_mismatch"] = True
+    except Exception:
+        pass
+
+    # ── Certificate Transparency (SCT) ───────────────────────────────────
+    try:
+        cert.extensions.get_extension_for_oid(
+            x509.oid.ExtensionOID.PRECERT_SIGNED_CERTIFICATE_TIMESTAMPS
+        )
+        result["cert_has_sct"] = True
+    except x509.ExtensionNotFound:
+        pass
+    except Exception:
+        pass
+
+    return result
+
+
+def _is_ip_address(hostname: str) -> bool:
+    """True if hostname looks like an IP address (v4 or v6)."""
+    try:
+        import ipaddress
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        return False
+
+
+def _hostname_matches_san(hostname: str, san_list: list[str]) -> bool:
+    """Check if hostname matches any SAN entry (supports wildcard certs)."""
+    hostname = hostname.lower()
+    for san in san_list:
+        san = san.lower()
+        if san == hostname:
+            return True
+        # Wildcard match: *.example.com matches sub.example.com but not example.com
+        if san.startswith("*."):
+            wildcard_base = san[2:]
+            if hostname.endswith(wildcard_base) and hostname.count(".") == san.count("."):
+                return True
+    return False
+
+
+def _check_trusted_ca(ip: str, port: int, hostname: str | None = None) -> bool:
+    """
+    Attempt a TLS connection with full certificate validation (system trust store).
+    Returns True if the certificate chain is trusted, False otherwise.
+    """
+    try:
+        ctx = ssl.create_default_context()  # default: CERT_REQUIRED + system CA bundle
+        server_hostname = hostname or ip
+        with socket.create_connection((ip, port), timeout=PROBE_TIMEOUT) as sock:
+            with ctx.wrap_socket(sock, server_hostname=server_hostname):
+                return True
+    except Exception:
+        return False
+
+
+def _probe_tls_details(ip: str, port: int, hostname: str | None = None) -> dict | None:
+    """
+    Connect via TLS and collect protocol version, cipher suite, and cert info.
+    Returns None if TLS is not available on this port.
+
+    Uses ``getpeercert(binary_form=True)`` + ``cryptography`` for cert parsing
+    (``getpeercert()`` returns an empty dict under CERT_NONE).
+    Also performs a separate validated connection to check CA trust.
+    """
+    try:
+        with socket.create_connection((ip, port), timeout=PROBE_TIMEOUT) as sock:
+            with _tls_context().wrap_socket(sock, server_hostname=ip) as ssock:
+                version = ssock.version() or ""
+                cipher_name, _, cipher_bits = ssock.cipher() or ("", "", 0)
+                der_bytes = ssock.getpeercert(binary_form=True)
+                cert_info = _parse_cert_details(der_bytes, hostname or ip) if der_bytes else {
+                    "cert_expiry_days": None, "cert_self_signed": False,
+                    "cert_key_type": None, "cert_key_bits": None,
+                    "cert_sig_algorithm": None, "cert_sig_sha1": False,
+                    "cert_san_list": [], "cert_san_mismatch": False,
+                    "cert_has_sct": False,
+                }
+                # Check CA trust via a separate validated connection
+                cert_info["cert_trusted"] = _check_trusted_ca(ip, port, hostname)
+                return {
+                    "tls_version":  version,
+                    "cipher_name":  cipher_name or "",
+                    "cipher_bits":  cipher_bits or 0,
+                    **cert_info,
+                }
+    except (OSError, ssl.SSLError):
+        return None  # No TLS or connection refused/timed out
+    except Exception as e:
+        logger.debug(f"[tls_checker] TLS detail probe failed on {ip}:{port}: {type(e).__name__}: {e}")
+        return None
+
+
+def _check_legacy_protocol_support(ip: str, port: int) -> dict:
+    """
+    Probe whether the server accepts deprecated TLS 1.0 or TLS 1.1.
+    Per RFC 8996 both are deprecated. TLS 1.0 is also vulnerable to BEAST.
+
+    Returns {"tls10": bool, "tls11": bool}.
+    Note: if the system OpenSSL has these disabled, checks always return False.
+    """
+    results: dict[str, bool] = {"tls10": False, "tls11": False}
+    for tls_version, key in _LEGACY_TLS_VERSIONS:
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ctx.minimum_version = tls_version
+            ctx.maximum_version = tls_version
+            with socket.create_connection((ip, port), timeout=PROBE_TIMEOUT) as sock:
+                with ctx.wrap_socket(sock, server_hostname=ip):
+                    results[key] = True
+        except Exception:
+            pass
+    return results
+
+
+def _probe_tls(ip: str, port: int, service: str, hostname: str | None = None) -> dict | None:
+    """
+    Probe TLS for a non-web port. Returns TLS details dict if TLS is available,
+    None if no TLS (or STARTTLS + direct TLS both fail).
+
+    For STARTTLS services: tries STARTTLS first, falls back to direct TLS
+    (handles implicit TLS on non-standard ports e.g. smtps on 465).
+    """
+    if service in _STARTTLS_PROBERS:
+        # Try STARTTLS — if it works, do a full detail probe via direct TLS
+        # (STARTTLS details aren't easily extractable from smtplib/imaplib)
+        starttls_ok = _STARTTLS_PROBERS[service](ip, port)
+        details = _probe_tls_details(ip, port, hostname)
+        if details:
+            return details  # Direct TLS also works (implicit TLS port)
+        if starttls_ok:
+            # STARTTLS works but direct TLS doesn't — return minimal detail dict
+            return {
+                "tls_version": "", "cipher_name": "", "cipher_bits": 0,
+                "cert_expiry_days": None, "cert_self_signed": False,
+                "cert_key_type": None, "cert_key_bits": None,
+                "cert_sig_algorithm": None, "cert_sig_sha1": False,
+                "cert_san_list": [], "cert_san_mismatch": False,
+                "cert_has_sct": False, "cert_trusted": False,
+            }
+        return None
+    return _probe_tls_details(ip, port, hostname)
+
+
+# ---------------------------------------------------------------------------
+# Cipher suite enumeration via nmap ssl-enum-ciphers
+# ---------------------------------------------------------------------------
+
+# Maps nmap strength letter to sortable integer (higher = stronger).
+_STRENGTH_ORDER = {"A": 4, "B": 3, "C": 2, "D": 1, "F": 0}
+
+
+def _parse_cipher_enum_xml(xml_output: str, port: int) -> dict:
+    """Parse nmap ssl-enum-ciphers XML output for the given port.
+
+    Returns a dict shaped as:
+        {
+            "TLSv1.2": [{"name": "ECDHE-RSA-AES256-GCM-SHA384", "strength": "A"}, ...],
+            "TLSv1.3": [...],
+            "least_strength": "C",   # weakest grade across all protocols
+        }
+    Returns {} if the script produced no output for this port.
+    """
+    try:
+        root = ET.fromstring(xml_output)
+    except ET.ParseError:
+        return {}
+
+    script = root.find(f".//port[@portid='{port}']/script[@id='ssl-enum-ciphers']")
+    if script is None:
+        return {}
+
+    protocols: dict = {}
+    overall_worst: str | None = None
+
+    for proto_table in script.findall("table"):
+        proto_name = proto_table.get("key", "")
+        if not (proto_name.startswith("TLS") or proto_name.startswith("SSL")):
+            continue
+
+        ciphers = []
+        for cipher_table in proto_table.findall("table[@key='ciphers']/table"):
+            name_elem = cipher_table.find("elem[@key='name']")
+            strength_elem = cipher_table.find("elem[@key='strength']")
+            if name_elem is not None and name_elem.text:
+                entry = {
+                    "name": name_elem.text.strip(),
+                    "strength": (strength_elem.text or "?").strip() if strength_elem is not None else "?",
+                }
+                ciphers.append(entry)
+                s = entry["strength"]
+                if s in _STRENGTH_ORDER:
+                    if overall_worst is None or _STRENGTH_ORDER[s] < _STRENGTH_ORDER.get(overall_worst, 4):
+                        overall_worst = s
+
+        if ciphers:
+            protocols[proto_name] = ciphers
+
+    if protocols:
+        protocols["least_strength"] = overall_worst or "?"
+
+    return protocols
+
+
+def _enumerate_ciphers(ip: str, port: int) -> dict:
+    """Run nmap ssl-enum-ciphers against ip:port.
+
+    Returns parsed cipher data (see _parse_cipher_enum_xml) or {} on any failure.
+    Uses settings.TOOL_NMAP; falls back to "nmap" if unset.
+    """
+    from django.conf import settings
+
+    binary = getattr(settings, "TOOL_NMAP", "nmap")
+    cmd = [
+        binary,
+        "--script", "ssl-enum-ciphers",
+        "-p", str(port),
+        ip,
+        "-oX", "-",
+        "--host-timeout", "60s",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        logger.warning(f"[tls_checker] nmap not found — skipping cipher enumeration on {ip}:{port}")
+        return {}
+    except subprocess.TimeoutExpired:
+        logger.warning(f"[tls_checker] nmap cipher enumeration timed out on {ip}:{port}")
+        return {}
+
+    if not result.stdout:
+        return {}
+
+    return _parse_cipher_enum_xml(result.stdout, port)
+
+
+# ---------------------------------------------------------------------------
+# Main collection function
+# ---------------------------------------------------------------------------
+
+def collect(session) -> list[dict]:
+    """
+    Probe all open ports for TLS status and configuration — including HTTPS (port 443).
+
+    Returns one result dict per port that requires TLS analysis:
+      {
+        ip, port, service,
+        has_tls:           bool,
+        is_web:            bool,
+        inherently_insecure: bool,
+        port_fk, url_fk,
+        # populated when has_tls=True:
+        tls_version:       str,              # "TLSv1.3", "TLSv1.2", ""
+        cipher_name:       str,              # OpenSSL cipher name
+        cipher_bits:       int,
+        cert_expiry_days:  int | None,
+        cert_self_signed:  bool,
+        supports_tls10:    bool,
+        supports_tls11:    bool,
+      }
+
+    Ports with unknown services (not in TLS_CAPABLE or INHERENTLY_INSECURE)
+    are omitted — no findings can be generated.
+    Plain HTTP ports (service="http") produce no TLS findings because the probe
+    returns no TLS details; HSTS coverage for those is handled by web_checker.
+    """
+    from apps.core.assets.models import Port
+
+    open_ports = list(
+        Port.objects.filter(session=session, state="open")
+        .select_related("ip_address__subdomain")
+    )
+    if not open_ports:
+        return []
+
+    _tls_empty = {
+        "tls_version": "", "cipher_name": "", "cipher_bits": 0,
+        "cert_expiry_days": None, "cert_self_signed": False,
+        "cert_key_type": None, "cert_key_bits": None,
+        "cert_sig_algorithm": None, "cert_sig_sha1": False,
+        "cert_san_list": [], "cert_san_mismatch": False,
+        "cert_has_sct": False, "cert_trusted": False,
+        "supports_tls10": False, "supports_tls11": False,
+        "hsts_header": None,
+        "supported_ciphers": {},
+    }
+
+    results = []
+    for p in open_ports:
+        ip = p.address
+        port_num = p.port
+        service = (p.service or "").lower()
+
+        # Resolve hostname: subdomain > IP fallback
+        if p.ip_address and p.ip_address.subdomain:
+            host = p.ip_address.subdomain.subdomain
+        else:
+            host = ip
+
+        if service in INHERENTLY_INSECURE_SERVICES:
+            logger.debug(f"[tls_checker:{session.id}] {ip}:{port_num} inherently insecure ({service})")
+            results.append({
+                "ip": ip, "port": port_num, "service": service,
+                "has_tls": False, "is_web": p.is_web, "scheme": None,
+                "inherently_insecure": True,
+                "port_fk": p, "url_fk": None,
+                **_tls_empty,
+            })
+
+        elif service in TLS_CAPABLE_SERVICES:
+            logger.debug(f"[tls_checker:{session.id}] Probing TLS on {host}:{port_num} ({service})")
+            details = _probe_tls(ip, port_num, service, hostname=host)
+            has_tls = details is not None
+            tls_detail = _tls_empty.copy()
+
+            if has_tls and details:
+                legacy = _check_legacy_protocol_support(ip, port_num)
+                cipher_data = _enumerate_ciphers(ip, port_num)
+                tls_detail = {**details, **legacy, "supported_ciphers": cipher_data}
+
+            results.append({
+                "ip": ip, "port": port_num, "service": service,
+                "has_tls": has_tls, "is_web": p.is_web, "scheme": None,
+                "inherently_insecure": False,
+                "port_fk": p, "url_fk": None,
+                **tls_detail,
+            })
+
+        else:
+            # Unknown or empty service — try direct TLS probe
+            logger.debug(f"[tls_checker:{session.id}] Probing unknown service on {host}:{port_num}")
+            details = _probe_tls_details(ip, port_num, hostname=host)
+            if details:
+                legacy = _check_legacy_protocol_support(ip, port_num)
+                cipher_data = _enumerate_ciphers(ip, port_num)
+                tls_detail = {**details, **legacy, "supported_ciphers": cipher_data}
+                results.append({
+                    "ip": ip, "port": port_num, "service": service,
+                    "has_tls": True, "is_web": p.is_web, "scheme": None,
+                    "inherently_insecure": False,
+                    "port_fk": p, "url_fk": None,
+                    **tls_detail,
+                })
+
+    encrypted = sum(1 for r in results if r["has_tls"])
+    plaintext = len(results) - encrypted
+    logger.info(
+        f"[tls_checker:{session.id}] Checked {len(results)} ports: "
+        f"{encrypted} encrypted, {plaintext} plaintext"
+    )
+    return results
